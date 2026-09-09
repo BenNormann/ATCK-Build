@@ -47,22 +47,88 @@
   // Action names are limited to 12 bytes.
   var ACTION = 'st';
   var RELAY_REDUNDANCY = 4; // public relays churn; redundancy keeps rooms forming
-  // ICE: STUN finds a direct path when both NATs allow one; TURN relays the
-  // traffic when they do not (symmetric NAT, phone hotspots, office networks).
-  // Without a relay those joins fail after the SDP exchange. The Open Relay
-  // project's public TURN is free but shared and rate limited; a page can
-  // override the whole list by defining window.ATCK_ICE_SERVERS before net.js
-  // runs (an own coturn server is the release answer).
-  var DEFAULT_ICE_SERVERS = [
+  // ICE is STUN only, by design: the game is peer to peer and never relays
+  // through a server. STUN tells each browser its own outside address so the
+  // two can punch through their routers; several servers raise the odds of a
+  // usable answer. When both routers are symmetric no direct path exists and
+  // the diagnosis below says so.
+  var ICE_SERVERS = [
     { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-    { urls: 'stun:stun.relay.metered.ca:80' },
-    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+    { urls: 'stun:stun.cloudflare.com:3478' }
   ];
-  function iceServers() {
-    var custom = typeof window !== 'undefined' ? window.ATCK_ICE_SERVERS : null;
-    return (custom && custom.length) ? custom : DEFAULT_ICE_SERVERS;
+  function iceServers() { return ICE_SERVERS; }
+
+  // Connection diagnosis: what each side gathered and how the attempt ended,
+  // logged on the console and folded into the join error so a failure names
+  // its cause (no reflexive address = STUN blocked; both sides reflexive but
+  // no pair = symmetric NAT on at least one side; IPv6 on both = should work).
+  var iceDiag = {};           // peerId -> { local: {host,srflx,prflx,v6}, remote: {...}, state }
+  function diagFor(peerId) {
+    if (!iceDiag[peerId]) iceDiag[peerId] = { local: { host: 0, srflx: 0, prflx: 0, v6: 0 }, remote: { host: 0, srflx: 0, prflx: 0, v6: 0 }, state: 'new' };
+    return iceDiag[peerId];
+  }
+  function countCandidate(bucket, cand) {
+    if (!cand) return;
+    var type = cand.type || (cand.candidate && / typ (\w+)/.exec(cand.candidate) || [])[1];
+    if (type && bucket.hasOwnProperty(type)) bucket[type]++;
+    var addr = cand.address || (cand.candidate && cand.candidate.split(' ')[4]) || '';
+    if (addr.indexOf(':') >= 0) bucket.v6++;
+  }
+  function describe(b) {
+    return 'host ' + b.host + ', reflexive ' + b.srflx + ', peer-reflexive ' + b.prflx + ', ipv6 ' + b.v6;
+  }
+  function diagnose(peerId) {
+    var d = iceDiag[peerId];
+    if (!d) return 'no ICE data';
+    var why;
+    if (d.local.srflx === 0 && d.local.host > 0) why = 'this browser got no reflexive address: STUN (UDP 19302/3478) is blocked on this network';
+    else if (d.remote.srflx === 0 && d.remote.host > 0 && d.remote.v6 === 0) why = 'the other browser sent no reflexive address: STUN is blocked on its network';
+    else if (d.local.srflx > 0 && d.remote.srflx > 0) why = 'both sides had reflexive addresses but no pair connected: symmetric NAT on at least one side (phone hotspot, office or campus network); a direct path does not exist between these two networks';
+    else why = 'candidates never arrived from the other side: the offer reached it over the relays but its answer or candidates did not come back';
+    return 'local [' + describe(d.local) + '] remote [' + describe(d.remote) + '] state ' + d.state + ': ' + why;
+  }
+  function watchPeerConnection(peerId, pc) {
+    if (!pc || pc.__atckWatched) return;
+    pc.__atckWatched = true;
+    var d = diagFor(peerId);
+    pc.addEventListener('icecandidate', function (e) { countCandidate(d.local, e.candidate); });
+    pc.addEventListener('iceconnectionstatechange', function () {
+      d.state = pc.iceConnectionState;
+      log('ice', peerId, d.state);
+      if (d.state === 'connected' || d.state === 'completed') reportSelectedPair(peerId, pc);
+      if (d.state === 'failed') console.warn(TAG, 'ice failed', peerId, diagnose(peerId));
+    });
+    var origAdd = pc.addIceCandidate.bind(pc);
+    pc.addIceCandidate = function (cand) { countCandidate(d.remote, cand); return origAdd(cand); };
+    var origSet = pc.setRemoteDescription.bind(pc);
+    pc.setRemoteDescription = function (desc) {
+      try {
+        var sdp = desc && desc.sdp ? desc.sdp : '';
+        var lines = sdp.split('\n');
+        for (var i = 0; i < lines.length; i++) if (lines[i].indexOf('a=candidate:') === 0) countCandidate(d.remote, { candidate: lines[i].slice(2) });
+      } catch (e) { }
+      return origSet(desc);
+    };
+  }
+  function reportSelectedPair(peerId, pc) {
+    if (!pc.getStats) return;
+    pc.getStats().then(function (stats) {
+      var pairs = {}, cands = {};
+      stats.forEach(function (r) { if (r.type === 'candidate-pair') pairs[r.id] = r; else if (r.type === 'local-candidate' || r.type === 'remote-candidate') cands[r.id] = r; });
+      Object.keys(pairs).forEach(function (id) {
+        var p = pairs[id];
+        if (p.state !== 'succeeded' || !(p.selected || p.nominated)) return;
+        var l = cands[p.localCandidateId] || {}, r = cands[p.remoteCandidateId] || {};
+        log('connected', peerId, 'via', (l.candidateType || '?') + '->' + (r.candidateType || '?'), (l.protocol || ''), (l.address && l.address.indexOf(':') >= 0) ? 'ipv6' : 'ipv4');
+      });
+    }).catch(function () { });
+  }
+  function watchAllPeers() {
+    if (!room || typeof room.getPeers !== 'function') return;
+    try {
+      var peers = room.getPeers() || {};
+      Object.keys(peers).forEach(function (id) { watchPeerConnection(id, peers[id]); });
+    } catch (e) { }
   }
   var TAG = '[AHNet]';
 
@@ -568,7 +634,9 @@
         {
           onJoinError: function (details) {
             console.error(TAG, 'join error:', details);
-            emit('OnNetError', 'join failed: ' + (details && details.error));
+            var why = '';
+            try { Object.keys(iceDiag).forEach(function (id) { why += ' | ' + diagnose(id); }); } catch (e) { }
+            emit('OnNetError', 'join failed: ' + (details && details.error) + why);
           }
         }
       );
@@ -582,6 +650,9 @@
     // Before the handlers: assigning room.onPeerJoin replays already-connected
     // peers into it, and those must land in a fresh liveness table.
     startLiveness();
+    var peerWatchTimer = setInterval(watchAllPeers, 500);
+    setTimeout(function () { clearInterval(peerWatchTimer); }, 120000);
+    watchAllPeers();
 
     // NOTE (known issue, spec §5.2): trystero 0.25 does not expose per-action
     // RTCDataChannel options, so the channel is ordered+reliable rather than

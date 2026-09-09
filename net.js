@@ -47,6 +47,23 @@
   // Action names are limited to 12 bytes.
   var ACTION = 'st';
   var RELAY_REDUNDANCY = 4; // public relays churn; redundancy keeps rooms forming
+  // ICE: STUN finds a direct path when both NATs allow one; TURN relays the
+  // traffic when they do not (symmetric NAT, phone hotspots, office networks).
+  // Without a relay those joins fail after the SDP exchange. The Open Relay
+  // project's public TURN is free but shared and rate limited; a page can
+  // override the whole list by defining window.ATCK_ICE_SERVERS before net.js
+  // runs (an own coturn server is the release answer).
+  var DEFAULT_ICE_SERVERS = [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    { urls: 'stun:stun.relay.metered.ca:80' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+  ];
+  function iceServers() {
+    var custom = typeof window !== 'undefined' ? window.ATCK_ICE_SERVERS : null;
+    return (custom && custom.length) ? custom : DEFAULT_ICE_SERVERS;
+  }
   var TAG = '[AHNet]';
 
   var room = null;
@@ -546,7 +563,7 @@
     var joined;
     try {
       joined = trystero.joinRoom(
-        { appId: APP_ID, relayConfig: { redundancy: RELAY_REDUNDANCY } },
+        { appId: APP_ID, relayConfig: { redundancy: RELAY_REDUNDANCY }, rtcConfig: { iceServers: iceServers() } },
         ROOM_PREFIX + currentRoomCode,
         {
           onJoinError: function (details) {

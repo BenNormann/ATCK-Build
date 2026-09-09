@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ATCK</title>
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; background: #0a0c12; overflow: hidden; }
+      /* The fullscreen target, so the loading text and any future overlay come along. */
+      #unity-container { position: relative; width: 100%; height: 100%; background: #0a0c12; }
+      #unity-canvas { width: 100%; height: 100%; display: block; background: #0a0c12; }
+      #loading {
+        position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+        color: #4dd8b8; font-family: ui-monospace, Consolas, monospace; font-size: 16px;
+        letter-spacing: 2px; text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="unity-container">
+      <canvas id="unity-canvas" tabindex="-1"></canvas>
+      <div id="loading">ATCK<br>loading… <span id="loading-pct">0%</span></div>
+    </div>
+    <script>
+      // right mouse is aim - never the browser context menu
+      document.getElementById("unity-canvas").addEventListener("contextmenu", function (e) { e.preventDefault(); });
+    </script>
+
+    <!-- Crouch is Ctrl, so the page has to swallow the browser's Ctrl combos; the ones
+         Chrome reserves (Ctrl+W and friends) need fullscreen plus Keyboard Lock. -->
+    <script src="keys.js"></script>
+
+    <!-- Networking lives in page JS, not WASM: trystero (vendored, no CDN) + our bridge layer. Order matters. -->
+    <script src="trystero.min.js"></script>
+    <script src="net.js"></script>
+    <script src="Build/ATCK.loader.js"></script>
+    <script>
+      createUnityInstance(document.querySelector("#unity-canvas"), {
+        arguments: [],
+        dataUrl: "Build/ATCK.data.unityweb",
+        frameworkUrl: "Build/ATCK.framework.js.unityweb",
+        codeUrl: "Build/ATCK.wasm.unityweb",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName: "AFTERHOURS",
+        productName: "ATCK",
+        productVersion: "0.1.0",
+      }, function (progress) {
+        document.getElementById("loading-pct").textContent = Math.round(progress * 100) + "%";
+      }).then(function (unityInstance) {
+        // net.js buffers inbound events until this is set AND the NetBridge
+        // GameObject has called AHNet_UnityReady — whichever happens last
+        // flushes the queue.
+        window.AH_UnityInstance = unityInstance;
+        document.getElementById("loading").style.display = "none";
+      }).catch(function (message) {
+        document.getElementById("loading").innerHTML = "failed to load:<br>" + message;
+      });
+    </script>
+  </body>
+</html>

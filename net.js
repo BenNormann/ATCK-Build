@@ -78,9 +78,31 @@
   function describe(b) {
     return 'host ' + b.host + (b.mdns ? ' (' + b.mdns + ' hidden as .local)' : '') + ', reflexive ' + b.srflx + ', peer-reflexive ' + b.prflx + ', ipv6 ' + b.v6;
   }
+  // trystero keeps a pool of spare connections that never talk to anybody: they sit in state new with
+  // nothing from the other side, and they are not failures.
+  function meaningful(d) {
+    return !!d && (d.state !== 'new' || d.remote.host + d.remote.srflx + d.remote.prflx > 0);
+  }
+  function rank(d) {
+    if (d.state === 'connected' || d.state === 'completed') return 4;
+    if (d.state === 'failed') return 3;
+    if (d.state === 'checking' || d.state === 'disconnected') return 2;
+    return 1;
+  }
+  function bestDiagnosis() {
+    var best = null;
+    Object.keys(iceDiag).forEach(function (id) {
+      var d = iceDiag[id];
+      if (meaningful(d) && (!best || rank(d) > rank(iceDiag[best]))) best = id;
+    });
+    return best ? diagnose(best) : 'no connection attempt got as far as trading addresses with the other player';
+  }
   function diagnose(peerId) {
     var d = iceDiag[peerId];
     if (!d) return 'no ICE data';
+    if (d.state === 'connected' || d.state === 'completed') {
+      return 'the two machines DID connect (local [' + describe(d.local) + '] remote [' + describe(d.remote) + ']); what failed came after it: the hello between the two pages did not finish in time. Try once more, and if it repeats press COPY NETWORK LOG on both machines';
+    }
     var why;
     if (d.local.srflx === 0 && d.local.host > 0) why = 'this browser got no reflexive address: STUN (UDP 19302/3478) is blocked on this network';
     else if (d.remote.srflx === 0 && d.remote.host > 0 && d.remote.v6 === 0) why = 'the other browser sent no reflexive address: STUN is blocked on its network';
@@ -101,7 +123,7 @@
       d.state = pc.iceConnectionState;
       log('ice', pc.__atckKey, d.state);
       if (d.state === 'connected' || d.state === 'completed') reportSelectedPair(peerId, pc);
-      if (d.state === 'failed') console.warn(TAG, 'ice failed', pc.__atckKey, diagnose(pc.__atckKey));
+      if (d.state === 'failed') { remember('warn', ['ice failed', pc.__atckKey, diagnose(pc.__atckKey)]); console.warn(TAG, 'ice failed', pc.__atckKey, diagnose(pc.__atckKey)); }
     });
     var origAdd = pc.addIceCandidate.bind(pc);
     pc.addIceCandidate = function (cand) { countCandidate(d.remote, cand); return origAdd(cand); };
@@ -192,8 +214,57 @@
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
   }
 
+  var netLog = [];            // the last few hundred lines, for the COPY NETWORK LOG button
+  function remember(level, args) {
+    try {
+      var parts = Array.prototype.slice.call(args).map(function (a) {
+        if (a instanceof Error) return a.name + ': ' + a.message;
+        if (typeof a === 'object') { try { return JSON.stringify(a); } catch (e) { return String(a); } }
+        return String(a);
+      });
+      netLog.push(new Date().toISOString().slice(11, 23) + ' ' + level + ' ' + parts.join(' '));
+      if (netLog.length > 400) netLog.splice(0, netLog.length - 400);
+    } catch (e) { }
+  }
   function log() {
+    remember('log', arguments);
     console.log.apply(console, [TAG].concat(Array.prototype.slice.call(arguments)));
+  }
+  function dumpLog() {
+    var head = 'ATCK network log  ' + new Date().toISOString() + '  ' + navigator.userAgent + '\n'
+      + 'room ' + currentRoomCode + (isHostSession ? ' (host)' : ' (client)') + '  self ' + (function () { try { return getSelfId(); } catch (e) { return '?'; } })() + '\n';
+    var diag = '';
+    try { Object.keys(iceDiag).forEach(function (id) { var d = iceDiag[id]; if (meaningful(d)) diag += id + ': ' + diagnose(id) + '\n'; }); } catch (e) { }
+    return head + (diag ? '--- connections\n' + diag : '') + '--- log\n' + netLog.join('\n');
+  }
+  var logButton = null;
+  function showLogButton() {
+    try {
+      if (logButton) return;
+      var b = document.createElement('button');
+      b.textContent = 'COPY NETWORK LOG';
+      b.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:99999;padding:8px 12px;font:12px monospace;'
+        + 'color:#9fe6b0;background:#10161a;border:1px solid #3a6b4a;cursor:pointer;opacity:0.92';
+      function done(word) { b.textContent = word; setTimeout(hideLogButton, 2500); }
+      b.onclick = function () {
+        var textOut = dumpLog();
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(textOut).then(function () { done('COPIED. PASTE IT TO CLAUDE'); }, function () { fallback(); });
+        } else fallback();
+        function fallback() {
+          var ta = document.createElement('textarea'); ta.value = textOut; document.body.appendChild(ta); ta.select();
+          try { document.execCommand('copy'); done('COPIED. PASTE IT TO CLAUDE'); } catch (e) { done('COPY FAILED'); }
+          document.body.removeChild(ta);
+        }
+      };
+      document.body.appendChild(b);
+      logButton = b;
+      setTimeout(hideLogButton, 120000);
+    } catch (e) { }
+  }
+  function hideLogButton() {
+    if (logButton && logButton.parentNode) logButton.parentNode.removeChild(logButton);
+    logButton = null;
   }
 
   // ---- peer liveness (wall clock) --------------------------------------
@@ -710,10 +781,16 @@
         {
           onJoinError: function (details) {
             console.error(TAG, 'join error:', details);
+            remember('error', ['join error', details]);
             var why = '';
-            try { Object.keys(iceDiag).forEach(function (id) { why += ' | ' + diagnose(id); }); } catch (e) { }
-            emit('OnNetError', 'join failed: ' + (details && details.error) + why);
-          }
+            try { why = bestDiagnosis(); } catch (e) { }
+            var msg = 'join failed: ' + (details && details.error) + ' | ' + why;
+            if (msg.length > 520) msg = msg.slice(0, 517) + '...';
+            showLogButton();
+            emit('OnNetError', msg);
+          },
+          // the library allows 10 s for its hello after a connection opens; a shared radio needs longer
+          handshakeTimeoutMs: 30000
         }
       );
     } catch (e) {
@@ -853,6 +930,7 @@
     voiceSetPeerVolume: voiceSetPeerVolume,
     voiceSetThreshold: voiceSetThreshold,
     unityReady: unityReady,
-    setLocalSink: setLocalSink
+    setLocalSink: setLocalSink,
+    dumpLog: dumpLog
   };
 })();

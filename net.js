@@ -64,7 +64,7 @@
   // no pair = symmetric NAT on at least one side; IPv6 on both = should work).
   var iceDiag = {};           // peerId -> { local: {host,srflx,prflx,v6}, remote: {...}, state }
   function diagFor(peerId) {
-    if (!iceDiag[peerId]) iceDiag[peerId] = { local: { host: 0, srflx: 0, prflx: 0, v6: 0 }, remote: { host: 0, srflx: 0, prflx: 0, v6: 0 }, state: 'new' };
+    if (!iceDiag[peerId]) iceDiag[peerId] = { local: { host: 0, srflx: 0, prflx: 0, v6: 0, mdns: 0 }, remote: { host: 0, srflx: 0, prflx: 0, v6: 0, mdns: 0 }, state: 'new' };
     return iceDiag[peerId];
   }
   function countCandidate(bucket, cand) {
@@ -72,10 +72,11 @@
     var type = cand.type || (cand.candidate && / typ (\w+)/.exec(cand.candidate) || [])[1];
     if (type && bucket.hasOwnProperty(type)) bucket[type]++;
     var addr = cand.address || (cand.candidate && cand.candidate.split(' ')[4]) || '';
+    if (type === 'host' && /\.local$/i.test(addr)) bucket.mdns++;
     if (addr.indexOf(':') >= 0) bucket.v6++;
   }
   function describe(b) {
-    return 'host ' + b.host + ', reflexive ' + b.srflx + ', peer-reflexive ' + b.prflx + ', ipv6 ' + b.v6;
+    return 'host ' + b.host + (b.mdns ? ' (' + b.mdns + ' hidden as .local)' : '') + ', reflexive ' + b.srflx + ', peer-reflexive ' + b.prflx + ', ipv6 ' + b.v6;
   }
   function diagnose(peerId) {
     var d = iceDiag[peerId];
@@ -85,18 +86,22 @@
     else if (d.remote.srflx === 0 && d.remote.host > 0 && d.remote.v6 === 0) why = 'the other browser sent no reflexive address: STUN is blocked on its network';
     else if (d.local.srflx > 0 && d.remote.srflx > 0) why = 'both sides had reflexive addresses but no pair connected: symmetric NAT on at least one side (phone hotspot, office or campus network); a direct path does not exist between these two networks';
     else why = 'candidates never arrived from the other side: the offer reached it over the relays but its answer or candidates did not come back';
+    var hidden = (d.local.host > 0 && d.local.mdns >= d.local.host) || (d.remote.host > 0 && d.remote.mdns >= d.remote.host);
+    if (hidden) why += '. Local addresses were hidden behind .local names on at least one side, which school and office networks cannot look up: '
+      + 'allow the microphone for this page on BOTH machines and join again, so the browsers trade real addresses (this is what the same Wi-Fi or a shared hotspot needs)';
     return 'local [' + describe(d.local) + '] remote [' + describe(d.remote) + '] state ' + d.state + ': ' + why;
   }
   function watchPeerConnection(peerId, pc) {
     if (!pc || pc.__atckWatched) return;
     pc.__atckWatched = true;
+    pc.__atckKey = peerId;
     var d = diagFor(peerId);
     pc.addEventListener('icecandidate', function (e) { countCandidate(d.local, e.candidate); });
     pc.addEventListener('iceconnectionstatechange', function () {
       d.state = pc.iceConnectionState;
-      log('ice', peerId, d.state);
+      log('ice', pc.__atckKey, d.state);
       if (d.state === 'connected' || d.state === 'completed') reportSelectedPair(peerId, pc);
-      if (d.state === 'failed') console.warn(TAG, 'ice failed', peerId, diagnose(peerId));
+      if (d.state === 'failed') console.warn(TAG, 'ice failed', pc.__atckKey, diagnose(pc.__atckKey));
     });
     var origAdd = pc.addIceCandidate.bind(pc);
     pc.addIceCandidate = function (cand) { countCandidate(d.remote, cand); return origAdd(cand); };
@@ -123,11 +128,24 @@
       });
     }).catch(function () { });
   }
+  var pcSeq = 0;
+  function WatchedPeerConnection(config, constraints) {
+    var pc = new window.RTCPeerConnection(config, constraints);
+    try { watchPeerConnection('connection ' + (++pcSeq), pc); } catch (e) { }
+    return pc;
+  }
   function watchAllPeers() {
     if (!room || typeof room.getPeers !== 'function') return;
     try {
       var peers = room.getPeers() || {};
-      Object.keys(peers).forEach(function (id) { watchPeerConnection(id, peers[id]); });
+      Object.keys(peers).forEach(function (id) {
+        var pc = peers[id];
+        if (pc && pc.__atckWatched && pc.__atckKey && pc.__atckKey !== id && iceDiag[pc.__atckKey]) {
+          iceDiag[id] = iceDiag[pc.__atckKey];
+          delete iceDiag[pc.__atckKey];
+          pc.__atckKey = id;
+        } else watchPeerConnection(id, pc);
+      });
     } catch (e) { }
   }
   var TAG = '[AHNet]';
@@ -461,6 +479,18 @@
       applyVoiceMode();
       return;
     }
+    if (primeStream) {
+      // the join already asked for the mic (primeLocalAddresses): adopt that stream instead of prompting twice
+      micStream = primeStream;
+      primeStream = null;
+      if (primeTimer) { clearTimeout(primeTimer); primeTimer = null; }
+      micTrack = micStream.getAudioTracks()[0] || null;
+      log('mic granted (asked at join)');
+      startVad();
+      applyVoiceMode();
+      if (room) shareMic(null);
+      return;
+    }
     if (micPending) return;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       voiceMode = VOICE_OFF;
@@ -619,8 +649,54 @@
 
   // ---- public API ------------------------------------------------------
 
+  // A browser without microphone permission offers only its default route's address, hidden behind a
+  // .local name. That cannot connect two machines on a school or office Wi-Fi (the names cannot be looked
+  // up there), nor a laptop sharing a hotspot (its hotspot address is not on the default route). With the
+  // permission granted it offers every interface with real addresses. So the join asks first, waits a
+  // little for the answer, and joins either way. The stream is muted, handed to the voice path if voice
+  // is on, and released shortly after the join if it is not.
+  var primeStream = null;
+  var primeTimer = null;
+  var startToken = 0;
+  function releasePrime() {
+    if (primeTimer) { clearTimeout(primeTimer); primeTimer = null; }
+    if (primeStream) { primeStream.getTracks().forEach(function (t) { t.stop(); }); primeStream = null; }
+  }
+  function primeLocalAddresses(done) {
+    var finished = false;
+    function go() { if (finished) return; finished = true; done(); }
+    if (micStream || primeStream || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { go(); return; }
+    if (micPending) {
+      // the voice setting is already asking: wait for that answer instead of prompting twice
+      var waited = 0;
+      var poll = setInterval(function () { waited += 250; if (!micPending || waited >= 20000) { clearInterval(poll); go(); } }, 250);
+      return;
+    }
+    log('asking for the microphone before joining, so this browser offers real local addresses');
+    var giveUp = setTimeout(function () { log('no answer to the microphone prompt; joining anyway'); go(); }, 20000);
+    navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }).then(function (stream) {
+      clearTimeout(giveUp);
+      stream.getAudioTracks().forEach(function (t) { t.enabled = false; });
+      if (micStream || primeStream) { stream.getTracks().forEach(function (t) { t.stop(); }); go(); return; }
+      primeStream = stream;
+      primeTimer = setTimeout(releasePrime, 45000);
+      go();
+    }).catch(function (e) {
+      clearTimeout(giveUp);
+      log('microphone not granted (' + (e && e.name) + '); joining with hidden local addresses');
+      go();
+    });
+  }
+
   function start(roomCode, isHost) {
+    var mine = ++startToken;
+    primeLocalAddresses(function () { if (mine === startToken) startNow(roomCode, isHost); });
+  }
+
+  function startNow(roomCode, isHost) {
     if (room) leave();
+    iceDiag = {};
+    pcSeq = 0;
     currentRoomCode = String(roomCode || '').toUpperCase();
     isHostSession = !!isHost;
     log('joining room', currentRoomCode, isHostSession ? '(host)' : '(client)',
@@ -629,7 +705,7 @@
     var joined;
     try {
       joined = trystero.joinRoom(
-        { appId: APP_ID, relayConfig: { redundancy: RELAY_REDUNDANCY }, rtcConfig: { iceServers: iceServers() } },
+        { appId: APP_ID, relayConfig: { redundancy: RELAY_REDUNDANCY }, rtcConfig: { iceServers: iceServers() }, rtcPolyfill: WatchedPeerConnection },
         ROOM_PREFIX + currentRoomCode,
         {
           onJoinError: function (details) {
@@ -701,6 +777,7 @@
   }
 
   function leave() {
+    startToken++; // a join still waiting on the microphone prompt is abandoned
     stopDiagnostics();
     stopRelayRefresh();
     stopPing();
